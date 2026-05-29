@@ -1,0 +1,5 @@
+# Logs from chatbot runs (contain conversation history)
+logs/
+
+# Secrets
+.env

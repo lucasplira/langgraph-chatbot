@@ -1,18 +1,10 @@
-import json
 import os
 from datetime import datetime
-from pathlib import Path
-from typing import Annotated
 
-from typing_extensions import TypedDict
-
-from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langchain.agents.factory import create_agent
 
 
 # --- Config & validation ----------------------------------------------------
@@ -30,29 +22,18 @@ if not os.getenv("TAVILY_API_KEY"):
 MODEL = os.getenv("MODEL", "openai/gpt-4o-mini")
 THREAD_ID = os.getenv("THREAD_ID", "default")
 
-LOG_DIR = Path("/app/logs")
-LOG_DIR.mkdir(exist_ok=True)
-
 
 # --- System prompt ----------------------------------------------------------
 
-SYSTEM = SystemMessage(
-    content=(
-        f"You are a helpful assistant. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-        "For questions about current events, weather, news, prices, or recent facts, "
-        "you MUST use the search tool. "
-        "If a search result conflicts with what you remember from training, "
-        "trust the search result - it has fresher information than you. "
-        "If the search doesn't return a useful answer, say you don't know "
-        "rather than inventing facts, dates, or URLs."
-    )
+SYSTEM_PROMPT = (
+    f"You are a helpful assistant. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+    "For questions about current events, weather, news, prices, or recent facts, "
+    "you MUST use the search tool. "
+    "If a search result conflicts with what you remember from training, "
+    "trust the search result - it has fresher information than you. "
+    "If the search doesn't return a useful answer, say you don't know "
+    "rather than inventing facts, dates, or URLs."
 )
-
-
-# --- State ------------------------------------------------------------------
-
-class State(TypedDict):
-    messages: Annotated[list, add_messages]
 
 
 # --- LLM and tools ----------------------------------------------------------
@@ -63,49 +44,17 @@ llm = ChatOpenAI(
     model=MODEL,
 )
 
-tools = [TavilySearch(max_results=2)]
-llm_with_tools = llm.bind_tools(tools)
+tools = [TavilySearch(max_results=5)]
 
 
-# --- Logging helper ---------------------------------------------------------
+# --- Graph ------------------------------------------------------------------
 
-def log_messages(messages, label: str) -> None:
-    """Dump a list of LangChain messages to disk as indented JSON.
-
-    Filename format: YYYY-MM-DD_HH-MM-SS-mmm_<label>.json so files sort
-    chronologically and don't collide within the same second.
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
-    path = LOG_DIR / f"{timestamp}_{label}.json"
-    payload = [m.model_dump() for m in messages]
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
-    print(f"[log] {path}")
-
-
-# --- Graph nodes ------------------------------------------------------------
-
-def chatbot(state: State):
-    messages = [SYSTEM] + state["messages"]
-    log_messages(messages, "input")
-    response = llm_with_tools.invoke(messages)
-    log_messages([response], "output")
-    return {"messages": [response]}
-
-
-# --- Graph wiring -----------------------------------------------------------
-
-graph_builder = StateGraph(State)
-graph_builder.add_node("chatbot", chatbot)
-graph_builder.add_node("tools", ToolNode(tools=tools))
-
-graph_builder.add_edge(START, "chatbot")
-graph_builder.add_conditional_edges("chatbot", tools_condition)
-graph_builder.add_edge("tools", "chatbot")
-
-graph = graph_builder.compile(checkpointer=InMemorySaver())
+graph = create_agent(
+    model=llm,
+    tools=tools,
+    system_prompt=SYSTEM_PROMPT,
+    checkpointer=InMemorySaver(),
+)
 
 config = {"configurable": {"thread_id": THREAD_ID}}
 
@@ -113,12 +62,22 @@ config = {"configurable": {"thread_id": THREAD_ID}}
 # --- Runtime ----------------------------------------------------------------
 
 def stream_graph_updates(user_input: str) -> None:
-    for event in graph.stream(
+    for chunk in graph.stream(
         {"messages": [{"role": "user", "content": user_input}]},
         config,
-        stream_mode="values",
+        stream_mode="updates",
     ):
-        event["messages"][-1].pretty_print()
+        for node_name, node_output in chunk.items():
+            for msg in node_output.get("messages", []):
+                if getattr(msg, "tool_calls", None):
+                    print(f"\n[debug] node={node_name}")
+                    for tc in msg.tool_calls:
+                        print(f"[debug] tool_call: {tc['name']} | args: {tc['args']}")
+                elif getattr(msg, "name", None):
+                    preview = msg.content[:10000].replace("\n", " ")
+                    print(f"[debug] tool_result ({msg.name}): {preview}")
+                elif msg.content:
+                    print(f"\nAssistant: {msg.content}")
 
 
 def main() -> None:

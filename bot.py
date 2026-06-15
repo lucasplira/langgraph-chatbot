@@ -3,8 +3,9 @@ from datetime import datetime
 
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain.agents.factory import create_agent
+from langchain.agents import create_agent
 
 
 # --- Config & validation ----------------------------------------------------
@@ -20,23 +21,11 @@ if not os.getenv("TAVILY_API_KEY"):
     )
 
 MODEL = os.getenv("MODEL", "openai/gpt-4o-mini")
-THREAD_ID = os.getenv("THREAD_ID", "default")
+PARENT_THREAD_ID = os.getenv("THREAD_ID", "parent-thread")
+SUBAGENT_THREAD_ID = "subagent-thread"
 
 
-# --- System prompt ----------------------------------------------------------
-
-SYSTEM_PROMPT = (
-    f"You are a helpful assistant. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-    "For questions about current events, weather, news, prices, or recent facts, "
-    "you MUST use the search tool. "
-    "If a search result conflicts with what you remember from training, "
-    "trust the search result - it has fresher information than you. "
-    "If the search doesn't return a useful answer, say you don't know "
-    "rather than inventing facts, dates, or URLs."
-)
-
-
-# --- LLM and tools ----------------------------------------------------------
+# --- LLM --------------------------------------------------------------------
 
 llm = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -44,27 +33,64 @@ llm = ChatOpenAI(
     model=MODEL,
 )
 
-tools = [TavilySearch(max_results=5)]
 
+# --- Subagent ---------------------------------------------------------------
 
-# --- Graph ------------------------------------------------------------------
-
-graph = create_agent(
-    model=llm,
-    tools=tools,
-    system_prompt=SYSTEM_PROMPT,
-    checkpointer=InMemorySaver(),
+SUBAGENT_SYSTEM_PROMPT = (
+    f"You are a research specialist. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+    "Your job is to answer questions using the search tool whenever needed. "
+    "Always prefer fresh search results over training memory for facts, events, or prices."
 )
 
-config = {"configurable": {"thread_id": THREAD_ID}}
+subagent_checkpointer = InMemorySaver()
+
+subagent_graph = create_agent(
+    model=llm,
+    tools=[TavilySearch(max_results=5)],
+    system_prompt=SUBAGENT_SYSTEM_PROMPT,
+    checkpointer=subagent_checkpointer,
+)
+
+subagent_config = {"configurable": {"thread_id": SUBAGENT_THREAD_ID}}
+
+
+@tool
+def research_agent(query: str) -> str:
+    """Delegate a research question to a specialized agent that can search the web."""
+    response = subagent_graph.invoke(
+        {"messages": [{"role": "user", "content": query}]},
+        subagent_config,
+    )
+    return response["messages"][-1].content
+
+
+# --- Parent agent -----------------------------------------------------------
+
+PARENT_SYSTEM_PROMPT = (
+    f"You are a helpful assistant. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+    "When you need to look up facts, recent events, news, prices, or any external information, "
+    "delegate the task to the research_agent tool. "
+    "Synthesize the result into a clear, concise answer for the user."
+)
+
+parent_checkpointer = InMemorySaver()
+
+parent_graph = create_agent(
+    model=llm,
+    tools=[research_agent],
+    system_prompt=PARENT_SYSTEM_PROMPT,
+    checkpointer=parent_checkpointer,
+)
+
+parent_config = {"configurable": {"thread_id": PARENT_THREAD_ID}}
 
 
 # --- Runtime ----------------------------------------------------------------
 
 def stream_graph_updates(user_input: str) -> None:
-    for chunk in graph.stream(
+    for chunk in parent_graph.stream(
         {"messages": [{"role": "user", "content": user_input}]},
-        config,
+        parent_config,
         stream_mode="updates",
     ):
         for node_name, node_output in chunk.items():
@@ -82,7 +108,8 @@ def stream_graph_updates(user_input: str) -> None:
 
 def main() -> None:
     print(f"[chatbot] Model: {MODEL}")
-    print(f"[chatbot] Thread: {THREAD_ID}")
+    print(f"[chatbot] Parent thread: {PARENT_THREAD_ID}")
+    print(f"[chatbot] Subagent thread: {SUBAGENT_THREAD_ID}")
     print("[chatbot] Type 'quit', 'exit', or 'q' to leave.\n")
 
     while True:
